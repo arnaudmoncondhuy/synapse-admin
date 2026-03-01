@@ -4,88 +4,80 @@ declare(strict_types=1);
 
 namespace ArnaudMoncondhuy\SynapseAdmin\Admin\Controller;
 
-use ArnaudMoncondhuy\SynapseCore\Storage\Entity\SynapseConversation;
-use ArnaudMoncondhuy\SynapseCore\Storage\Entity\SynapseMessage;
-use ArnaudMoncondhuy\SynapseCore\Storage\Repository\SynapseConversationRepository;
-use ArnaudMoncondhuy\SynapseCore\Storage\Repository\SynapseMessageRepository;
-use ArnaudMoncondhuy\SynapseCore\Storage\Repository\SynapseTokenUsageRepository;
+use ArnaudMoncondhuy\SynapseCore\Contract\PermissionCheckerInterface;
+use ArnaudMoncondhuy\SynapseCore\Security\AdminSecurityTrait;
 use ArnaudMoncondhuy\SynapseCore\Storage\Repository\SynapseProviderRepository;
 use ArnaudMoncondhuy\SynapseCore\Storage\Repository\SynapsePresetRepository;
-use ArnaudMoncondhuy\SynapseCore\Storage\Repository\SynapseConfigRepository;
+use ArnaudMoncondhuy\SynapseCore\Storage\Repository\SynapseLlmCallRepository;
 use ArnaudMoncondhuy\SynapseCore\Storage\Repository\SynapseVectorMemoryRepository;
-use Doctrine\ORM\EntityManagerInterface;
-use ArnaudMoncondhuy\SynapseCore\Security\AdminSecurityTrait;
-use ArnaudMoncondhuy\SynapseCore\Contract\PermissionCheckerInterface;
 use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\Routing\Attribute\Route;
-use Symfony\Component\Security\Csrf\CsrfTokenManagerInterface;
 
 /**
- * Dashboard administrateur - Vue d'ensemble Synapse
+ * Dashboard Administration Synapse — Vue d'ensemble Synapse
+ *
+ * Ce contrôleur est intentionnellement "mince" : il orchestre uniquement
+ * des appels aux services/repositories du Core, sans logique métier propre.
  */
-#[Route('/synapse/admin')]
+#[Route('/synapse/admin', name: 'synapse_admin_')]
 class DashboardController extends AbstractController
 {
     use AdminSecurityTrait;
 
     public function __construct(
-        private EntityManagerInterface $em,
-        private SynapseTokenUsageRepository $tokenUsageRepo,
-        private SynapseProviderRepository $providerRepo,
-        private SynapsePresetRepository $presetRepo,
-        private SynapseVectorMemoryRepository $vectorMemoryRepo,
-        private PermissionCheckerInterface $permissionChecker,
-        #[\Symfony\Component\DependencyInjection\Attribute\Autowire(param: 'synapse.persistence.conversation_class')]
-        private ?string $conversationClass = null,
+        private readonly PermissionCheckerInterface $permissionChecker,
+        private readonly SynapseLlmCallRepository $tokenUsageRepo,
+        private readonly SynapseProviderRepository $providerRepo,
+        private readonly SynapsePresetRepository $presetRepo,
+        private readonly SynapseVectorMemoryRepository $vectorMemoryRepo,
     ) {}
 
-    #[Route('', name: 'synapse_admin_index')]
-    #[Route('/dashboard', name: 'synapse_admin_dashboard')]
+    #[Route('', name: 'dashboard')]
+    #[Route('/dashboard', name: 'dashboard_alt')]
     public function dashboard(): Response
     {
         $this->denyAccessUnlessAdmin($this->permissionChecker);
 
-        // KPI : Conversations
-        $repoClass = $this->conversationClass ?? SynapseConversation::class;
-        $conversationRepo = $this->em->getRepository($repoClass);
-        $last24h = new \DateTimeImmutable('-24 hours');
+        $now      = new \DateTimeImmutable();
+        $last7d   = new \DateTimeImmutable('-7 days');
+        $last30d  = new \DateTimeImmutable('-30 days');
+        $last24h  = new \DateTimeImmutable('-24 hours');
 
-        // Check if repository supports the custom methods (in case persistence is disabled/abstract)
-        $conversationsLast24h = method_exists($conversationRepo, 'countActiveLast24h') ? $conversationRepo->countActiveLast24h() : 0;
-        $activeUsersLast24h = method_exists($conversationRepo, 'countActiveUsersSince') ? $conversationRepo->countActiveUsersSince($last24h) : 0;
+        // KPIs token usage
+        $tokenStats  = $this->tokenUsageRepo->getGlobalStats($last7d, $now);
+        $dailyUsage  = $this->tokenUsageRepo->getDailyUsage($last30d, $now);
+        $usageByModel = $this->tokenUsageRepo->getUsageByModel($last7d, $now);
 
-        // Usage tokens (7 derniers jours)
-        $last7days = new \DateTimeImmutable('-7 days');
-        $now = new \DateTimeImmutable();
-        $tokenStats = $this->tokenUsageRepo->getGlobalStats($last7days, $now);
+        // Providers actifs
+        $activeProviders = array_filter(
+            $this->providerRepo->findAll(),
+            fn($p) => $p->isEnabled() && $p->isConfigured()
+        );
 
-        // Usage quotidien (30 derniers jours pour le graphique)
-        $last30days = new \DateTimeImmutable('-30 days');
-        $dailyUsage = $this->tokenUsageRepo->getDailyUsage($last30days, $now);
-
-        // Active providers (enabled and configured)
-        $activeProviders = array_filter($this->providerRepo->findAll(), function ($provider) {
-            return $provider->isEnabled() && $provider->isConfigured();
-        });
-
-        // Active preset
+        // Preset actif
         $activePreset = $this->presetRepo->findActive();
 
-        // Nombre total de souvenirs mémorisés
+        // Mémoire vectorielle
         $totalMemories = $this->vectorMemoryRepo->count([]);
 
-        return $this->render('@Synapse/admin/dashboard.html.twig', [
+        // Extraire les coûts par devise
+        $costs = $tokenStats['costs'] ?? [];
+        $costs_eur = $costs['EUR'] ?? 0;
+        $costs_usd = $costs['USD'] ?? 0;
+
+        return $this->render('@Synapse/admin/dashboard/index.html.twig', [
             'kpis' => [
-                'active_conversations' => $conversationsLast24h,
-                'active_users_24h'     => $activeUsersLast24h,
-                'tokens_7d'            => $tokenStats['total_tokens'] ?? 0,
-                'tokens_cost'          => $tokenStats['cost'] ?? 0,
-                'total_memories'       => $totalMemories,
+                'tokens_7d'   => $tokenStats['total_tokens'] ?? 0,
+                'costs_eur'   => $costs_eur,
+                'costs_usd'   => $costs_usd,
+                'total_memories'  => $totalMemories,
+                'active_providers' => count($activeProviders),
             ],
-            'daily_usage'      => $dailyUsage,
+            'daily_usage'     => $dailyUsage,
+            'usage_by_model'  => $usageByModel,
             'active_providers' => $activeProviders,
-            'active_preset'    => $activePreset,
+            'active_preset'   => $activePreset,
         ]);
     }
 }

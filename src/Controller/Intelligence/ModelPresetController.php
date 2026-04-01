@@ -72,7 +72,7 @@ class ModelPresetController extends AbstractController
 
         // Pré-remplir avec les valeurs de config active
         $activeConfig = $this->configProvider->getConfig();
-        $preset->setProviderName('' !== $activeConfig->provider ? $activeConfig->provider : 'gemini');
+        $preset->setProviderName('' !== $activeConfig->provider ? $activeConfig->provider : 'google_vertex_ai');
         $preset->setModel('' !== $activeConfig->model ? $activeConfig->model : 'gemini-2.5-flash');
 
         return $this->render('@Synapse/admin/intelligence/preset_edit.html.twig', [
@@ -370,7 +370,7 @@ class ModelPresetController extends AbstractController
         $result = [];
         foreach ($this->capabilityRegistry->getKnownModels() as $modelId) {
             $caps = $this->capabilityRegistry->getCapabilities($modelId);
-            if ('embedding' !== $caps->type) {
+            if ($caps->supportsTextGeneration) {
                 $result[$caps->provider][] = $modelId;
             }
         }
@@ -379,7 +379,7 @@ class ModelPresetController extends AbstractController
     }
 
     /**
-     * @return array<string, array{provider: string, type: string, dimensions: int[], supportsThinking: bool, supportsSafetySettings: bool, supportsTopK: bool, supportsFunctionCalling: bool, supportsStreaming: bool, supportsVision: bool, supportsParallelToolCalls: bool, supportsResponseSchema: bool, maxInputTokens: int|null, maxOutputTokens: int|null, deprecatedAt: string|null}>
+     * @return array<string, array{provider: string, dimensions: int[], supportsThinking: bool, supportsSafetySettings: bool, supportsTopK: bool, supportsFunctionCalling: bool, supportsStreaming: bool, supportsTextGeneration: bool, supportsEmbedding: bool, supportsImageGeneration: bool, supportsVision: bool, supportsParallelToolCalls: bool, supportsResponseSchema: bool, maxInputTokens: int|null, maxOutputTokens: int|null, deprecatedAt: string|null, vertexRegions: list<string>, rgpdRisk: string|null, pricingInput: float|null, pricingOutput: float|null, pricingOutputImage: float|null}>
      */
     private function getFullModelsCapabilities(): array
     {
@@ -388,7 +388,6 @@ class ModelPresetController extends AbstractController
             $caps = $this->capabilityRegistry->getCapabilities($modelId);
             $result[$modelId] = [
                 'provider' => $caps->provider,
-                'type' => $caps->type,
                 'dimensions' => $caps->dimensions,
                 'supportsThinking' => $caps->supportsThinking,
                 'supportsSafetySettings' => $caps->supportsSafetySettings,
@@ -396,13 +395,20 @@ class ModelPresetController extends AbstractController
                 'supportsFunctionCalling' => $caps->supportsFunctionCalling,
                 'supportsStreaming' => $caps->supportsStreaming,
                 // Phase 1
+                'supportsTextGeneration' => $caps->supportsTextGeneration,
+                'supportsEmbedding' => $caps->supportsEmbedding,
+                'supportsImageGeneration' => $caps->supportsImageGeneration,
                 'supportsVision' => $caps->supportsVision,
                 'supportsParallelToolCalls' => $caps->supportsParallelToolCalls,
                 'supportsResponseSchema' => $caps->supportsResponseSchema,
                 'maxInputTokens' => $caps->maxInputTokens,
                 'maxOutputTokens' => $caps->maxOutputTokens,
                 'deprecatedAt' => $caps->deprecatedAt,
-                'vertexRegion' => $caps->vertexRegion,
+                'vertexRegions' => $caps->vertexRegions,
+                'rgpdRisk' => $caps->rgpdRisk,
+                'pricingInput' => $caps->pricingInput,
+                'pricingOutput' => $caps->pricingOutput,
+                'pricingOutputImage' => $caps->pricingOutputImage,
             ];
         }
 
@@ -426,7 +432,7 @@ class ModelPresetController extends AbstractController
             unset($options['safety_settings']);
         }
 
-        if ('gemini' === $providerName) {
+        if ('google_vertex_ai' === $providerName) {
             if ($caps->supportsThinking && isset($options['thinking']) && is_array($options['thinking']) && !empty($options['thinking']['budget'])) {
                 $budget = is_numeric($options['thinking']['budget']) ? (int) $options['thinking']['budget'] : 0;
                 if ($budget < 128 || $budget > 32000) {

@@ -9,11 +9,19 @@ use ArnaudMoncondhuy\SynapseCore\Contract\PermissionCheckerInterface;
 use ArnaudMoncondhuy\SynapseCore\DatabaseConfigProvider;
 use ArnaudMoncondhuy\SynapseCore\Engine\LlmClientRegistry;
 use ArnaudMoncondhuy\SynapseCore\Engine\ModelCapabilityRegistry;
+use ArnaudMoncondhuy\SynapseCore\Governance\PresetArchitect\CandidateScanner;
+use ArnaudMoncondhuy\SynapseCore\Governance\PresetArchitect\HeuristicRecommender;
+use ArnaudMoncondhuy\SynapseCore\Governance\PresetArchitect\PresetArchitect;
 use ArnaudMoncondhuy\SynapseCore\PresetValidator;
 use ArnaudMoncondhuy\SynapseCore\Security\AdminSecurityTrait;
+use ArnaudMoncondhuy\SynapseCore\Shared\Enum\ModelRange;
+use ArnaudMoncondhuy\SynapseCore\Shared\Exception\CannotActivateException;
+use ArnaudMoncondhuy\SynapseCore\Shared\Model\DeactivationCascade;
 use ArnaudMoncondhuy\SynapseCore\Shared\Model\ModelCapabilities;
 use ArnaudMoncondhuy\SynapseCore\Storage\Entity\SynapseModelPreset;
+use ArnaudMoncondhuy\SynapseCore\Storage\Repository\SynapseAgentRepository;
 use ArnaudMoncondhuy\SynapseCore\Storage\Repository\SynapseModelPresetRepository;
+use ArnaudMoncondhuy\SynapseCore\Storage\Repository\SynapseModelRepository;
 use ArnaudMoncondhuy\SynapseCore\Storage\Repository\SynapseProviderRepository;
 use Doctrine\ORM\EntityManagerInterface;
 use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
@@ -39,6 +47,8 @@ class ModelPresetController extends AbstractController
     public function __construct(
         private readonly SynapseModelPresetRepository $presetRepo,
         private readonly SynapseProviderRepository $providerRepo,
+        private readonly SynapseModelRepository $modelRepo,
+        private readonly SynapseAgentRepository $agentRepo,
         private readonly ModelCapabilityRegistry $capabilityRegistry,
         private readonly LlmClientRegistry $llmRegistry,
         private readonly DatabaseConfigProvider $configProvider,
@@ -47,8 +57,31 @@ class ModelPresetController extends AbstractController
         private readonly CacheInterface $cache,
         private readonly PresetValidatorAgent $presetValidatorAgent,
         private readonly PresetValidator $presetValidator,
+        private readonly CandidateScanner $candidateScanner,
+        private readonly HeuristicRecommender $heuristicRecommender,
+        private readonly PresetArchitect $presetArchitect,
         private readonly ?CsrfTokenManagerInterface $csrfTokenManager = null,
     ) {
+    }
+
+    /**
+     * Helper privé : affiche un flash warning par niveau non-vide d'un cascade.
+     * Le paramètre $because permet de contextualiser le « pourquoi » dans chaque
+     * message (ex: « à la suite de la suppression du preset X »), sinon le flash
+     * reste générique si le cascade provient d'un point d'entrée non identifié.
+     */
+    private function flashCascade(DeactivationCascade $cascade, string $because = ''): void
+    {
+        $suffix = '' !== $because ? ' '.$because : '';
+        if (!empty($cascade->presets)) {
+            $this->addFlash('warning', sprintf('Presets désactivés%s : %s', $suffix, implode(', ', $cascade->presets)));
+        }
+        if (!empty($cascade->agents)) {
+            $this->addFlash('warning', sprintf('Agents désactivés%s : %s', $suffix, implode(', ', $cascade->agents)));
+        }
+        if (!empty($cascade->workflows)) {
+            $this->addFlash('warning', sprintf('Workflows désactivés%s : %s', $suffix, implode(', ', $cascade->workflows)));
+        }
     }
 
     // ─── Nouveau ───────────────────────────────────────────────────────────────
@@ -96,8 +129,26 @@ class ModelPresetController extends AbstractController
         if ($request->isMethod('POST')) {
             $this->validateCsrfToken($request, $this->csrfTokenManager, 'synapse_preset_edit');
             $this->applyFormData($preset, $request->request->all());
-            $this->em->flush();
+
+            // Validation AVANT le flush — si l'édition rend le preset invalide,
+            // on déclenche la cascade (agents → workflows) sur l'entité encore
+            // en mémoire puis on ne fait qu'UN SEUL flush atomique.
+            $cascade = DeactivationCascade::empty();
+            if (!$this->presetValidator->isValid($preset)) {
+                $cascade = $this->agentRepo->deactivateAllByModelPreset($preset);
+            }
+
+            $cascade = $this->em->wrapInTransaction(function () use ($cascade): DeactivationCascade {
+                $this->em->flush();
+
+                return $cascade;
+            });
             $this->configProvider->clearCache();
+
+            $this->flashCascade($cascade, sprintf(
+                'à la suite de la mise à jour du preset « %s »',
+                $preset->getName()
+            ));
 
             $this->addFlash('success', sprintf('Model Preset "%s" mis à jour.', $preset->getName()));
 
@@ -120,18 +171,15 @@ class ModelPresetController extends AbstractController
         $this->denyAccessUnlessAdmin($this->permissionChecker);
         $this->validateCsrfToken($request, $this->csrfTokenManager, 'synapse_preset_activate_'.$preset->getId());
 
-        // 🛡️ DÉFENSE : Vérifier que le preset est valide avant activation
-        if (!$this->presetValidator->isValid($preset)) {
-            $this->addFlash('error', sprintf(
-                'Impossible d\'activer le Model Preset "%s" : %s',
-                $preset->getName(),
-                $this->presetValidator->getInvalidReason($preset)
-            ));
+        // La validation d'activation est encapsulée dans presetRepo->activate().
+        try {
+            $this->presetRepo->activate($preset);
+        } catch (CannotActivateException $e) {
+            $this->addFlash('error', $e->getMessage());
 
             return $this->redirectToRoute('synapse_admin_configuration_llm', ['tab' => 'presets']);
         }
 
-        $this->presetRepo->activate($preset);
         $this->configProvider->clearCache();
 
         $this->addFlash('success', sprintf(
@@ -186,11 +234,21 @@ class ModelPresetController extends AbstractController
             return $this->redirectToRoute('synapse_admin_configuration_llm', ['tab' => 'presets']);
         }
 
+        // Cascade : déléguer à AgentRepo la propagation vers agents +
+        // workflows avant le remove. Sans ça, Doctrine ne fait que passer la
+        // FK des agents à NULL (onDelete: SET NULL) et ils se retrouveraient
+        // silencieusement à router vers le preset actif global.
         $name = $preset->getName();
-        $this->em->remove($preset);
-        $this->em->flush();
+        $cascade = $this->em->wrapInTransaction(function () use ($preset): DeactivationCascade {
+            $cascade = $this->agentRepo->deactivateAllByModelPreset($preset);
+            $this->em->remove($preset);
+            $this->em->flush();
+
+            return $cascade;
+        });
         $this->configProvider->clearCache();
 
+        $this->flashCascade($cascade, sprintf('à la suite de la suppression du preset « %s »', $name));
         $this->addFlash('success', sprintf('Model Preset "%s" supprimé.', $name));
 
         return $this->redirectToRoute('synapse_admin_configuration_llm', ['tab' => 'presets']);
@@ -359,6 +417,195 @@ class ModelPresetController extends AbstractController
         $preset->setStreamingEnabled(!empty($data['streaming_enabled']));
     }
 
+    // ─── Wizard ─────────────────────────────────────────────────────────────────
+
+    #[Route('/wizard/generate/status/{cacheKey}', name: 'presets_wizard_generate_status', methods: ['GET'])]
+    public function wizardGenerateStatus(string $cacheKey): Response
+    {
+        $this->denyAccessUnlessAdmin($this->permissionChecker);
+
+        /** @var array{status: string, input: array<string, mixed>, result: ?array<string, mixed>, error: ?string}|null $data */
+        $data = $this->cache->get($cacheKey, fn () => null);
+
+        if (!$data) {
+            return new JsonResponse(['status' => 'not_found'], 404);
+        }
+
+        // Premier poll : exécuter l'appel LLM
+        if ('pending' === $data['status']) {
+            set_time_limit(120);
+
+            try {
+                $aiDescriptionRaw = $data['input']['ai_description'] ?? '';
+                $aiDescription = is_string($aiDescriptionRaw) ? $aiDescriptionRaw : '';
+                $recommendation = $this->presetArchitect->generate($aiDescription, requireLlm: true);
+
+                $data['status'] = 'completed';
+                $data['result'] = $recommendation->toArray();
+            } catch (\Throwable $e) {
+                $data['status'] = 'error';
+                $data['error'] = $e->getMessage();
+            }
+
+            $this->cache->delete($cacheKey);
+            /** @var array<string, mixed> $finalData */
+            $finalData = $data;
+            $this->cache->get($cacheKey, function (ItemInterface $item) use ($finalData): array {
+                $item->expiresAfter(3600);
+
+                return $finalData;
+            });
+        }
+
+        if ('completed' === $data['status'] && null !== $data['result']) {
+            return $this->render('@Synapse/admin/intelligence/_preset_wizard_result.html.twig', [
+                'recommendation' => $data['result'],
+            ]);
+        }
+
+        if ('error' === $data['status']) {
+            return new JsonResponse(['status' => 'error', 'error' => $data['error'] ?? 'Erreur inconnue']);
+        }
+
+        return new JsonResponse(['status' => $data['status']]);
+    }
+
+    #[Route('/wizard', name: 'presets_wizard', methods: ['GET'])]
+    public function wizard(): Response
+    {
+        $this->denyAccessUnlessAdmin($this->permissionChecker);
+
+        $hasActivePreset = null !== $this->presetRepo->findOneBy(['isActive' => true]);
+
+        return $this->render('@Synapse/admin/intelligence/preset_wizard.html.twig', [
+            'has_active_preset' => $hasActivePreset,
+        ]);
+    }
+
+    #[Route('/wizard/generate', name: 'presets_wizard_generate', methods: ['POST'])]
+    public function wizardGenerate(Request $request): Response
+    {
+        $this->denyAccessUnlessAdmin($this->permissionChecker);
+        $this->validateCsrfToken($request, $this->csrfTokenManager, 'synapse_preset_wizard');
+        $data = $request->request->all();
+        $useCaseRaw = $data['use_case'] ?? 'conversation';
+        $useCase = is_string($useCaseRaw) ? $useCaseRaw : 'conversation';
+        $priorityRaw = $data['priority'] ?? 'balanced';
+        $priority = is_string($priorityRaw) ? $priorityRaw : 'balanced';
+        $rgpdSafe = !empty($data['rgpd_safe']);
+        $aiMode = !empty($data['ai_mode']);
+        $aiDescriptionRaw = $data['ai_description'] ?? '';
+        $aiDescription = is_string($aiDescriptionRaw) ? $aiDescriptionRaw : '';
+
+        // Mode IA : async via cache + polling
+        if ($aiMode && '' !== $aiDescription) {
+            $cacheKey = 'synapse_wizard_preset_'.uniqid();
+            $this->cache->delete($cacheKey);
+            $this->cache->get($cacheKey, function (ItemInterface $item) use ($aiDescription): array {
+                $item->expiresAfter(3600);
+
+                return ['status' => 'pending', 'input' => ['ai_description' => $aiDescription], 'result' => null, 'error' => null];
+            });
+
+            return $this->render('@Synapse/admin/intelligence/preset_wizard.html.twig', [
+                'has_active_preset' => true,
+                'step' => 'waiting',
+                'status_url' => $this->generateUrl('synapse_admin_presets_wizard_generate_status', ['cacheKey' => $cacheKey]),
+            ]);
+        }
+
+        // Mode guidé : heuristique
+        $requiredCapability = match ($useCase) {
+            'agents' => 'function_calling',
+            'image' => 'image_generation',
+            'embedding' => 'embedding',
+            default => 'text_generation',
+        };
+
+        $preferredRange = ModelRange::fromString($priority);
+
+        $candidates = $this->candidateScanner->scan(
+            requiredCapability: $requiredCapability,
+            rgpdSensitive: $rgpdSafe,
+        );
+
+        // Pour les agents, on veut aussi du text_generation
+        if ('agents' === $useCase) {
+            $candidates = array_values(array_filter(
+                $candidates,
+                fn ($c) => $c['capabilities']->supportsTextGeneration,
+            ));
+        }
+
+        if ([] === $candidates) {
+            $this->addFlash('error', 'Aucun modèle disponible pour ce type d\'usage. Vérifiez vos providers.');
+
+            return $this->redirectToRoute('synapse_admin_presets_wizard');
+        }
+
+        $recommendation = $this->heuristicRecommender->recommend($candidates, $preferredRange);
+
+        return $this->render('@Synapse/admin/intelligence/preset_wizard.html.twig', [
+            'has_active_preset' => null !== $this->presetRepo->findOneBy(['isActive' => true]),
+            'recommendation' => $recommendation->toArray(),
+            'step' => 'result',
+            'form_data' => $data,
+        ]);
+    }
+
+    #[Route('/wizard/create', name: 'presets_wizard_create', methods: ['POST'])]
+    public function wizardCreate(Request $request): Response
+    {
+        $this->denyAccessUnlessAdmin($this->permissionChecker);
+        $this->validateCsrfToken($request, $this->csrfTokenManager, 'synapse_preset_wizard_create');
+
+        $data = $request->request->all();
+
+        $preset = new SynapseModelPreset();
+        $preset->setName(is_string($data['name'] ?? null) ? $data['name'] : 'Preset généré');
+        $preset->setKey(is_string($data['key'] ?? null) ? $data['key'] : 'generated');
+        $preset->setProviderName(is_string($data['provider'] ?? null) ? $data['provider'] : '');
+        $preset->setModel(is_string($data['model'] ?? null) ? $data['model'] : '');
+        $preset->setGenerationTemperature(is_numeric($data['temperature'] ?? null) ? (float) $data['temperature'] : 1.0);
+        $preset->setGenerationTopP(is_numeric($data['top_p'] ?? null) ? (float) $data['top_p'] : 0.95);
+        $preset->setGenerationTopK(is_numeric($data['top_k'] ?? null) ? (int) $data['top_k'] : null);
+        $preset->setGenerationMaxOutputTokens(is_numeric($data['max_output_tokens'] ?? null) ? (int) $data['max_output_tokens'] : null);
+        $preset->setStreamingEnabled(!empty($data['streaming_enabled']));
+
+        // Provider options (thinking)
+        $providerOptionsRaw = $data['provider_options'] ?? null;
+        if (is_string($providerOptionsRaw) && '' !== $providerOptionsRaw) {
+            $decoded = json_decode($providerOptionsRaw, true);
+            if (is_array($decoded)) {
+                $preset->setProviderOptions($decoded);
+            }
+        }
+
+        $this->em->persist($preset);
+        $this->em->flush();
+
+        // Activer si demandé
+        $activate = !empty($data['activate']);
+        if ($activate) {
+            try {
+                $this->presetRepo->activate($preset);
+                $this->configProvider->clearCache();
+                $this->addFlash('success', sprintf('Preset « %s » créé et activé comme preset par défaut.', $preset->getName()));
+            } catch (CannotActivateException $e) {
+                $this->addFlash('warning', sprintf('Preset créé mais impossible de l\'activer : %s', $e->getMessage()));
+            }
+        } else {
+            $this->addFlash('success', sprintf('Preset « %s » créé avec succès.', $preset->getName()));
+        }
+
+        return $this->render('@Synapse/admin/intelligence/preset_wizard.html.twig', [
+            'has_active_preset' => true,
+            'step' => 'created',
+            'created_preset_id' => $preset->getId(),
+            'created_preset_name' => $preset->getName(),
+        ]);
+    }
+
     /**
      * @return array<string, mixed>
      */
@@ -384,12 +631,14 @@ class ModelPresetController extends AbstractController
      */
     private function getModelsByProvider(): array
     {
+        $disabled = array_flip($this->modelRepo->findDisabledModelIds());
         $result = [];
         foreach ($this->capabilityRegistry->getKnownModels() as $modelId) {
-            $caps = $this->capabilityRegistry->getCapabilities($modelId);
-            if ($caps->supportsTextGeneration) {
-                $result[$caps->provider][] = $modelId;
+            if (isset($disabled[$modelId])) {
+                continue;
             }
+            $caps = $this->capabilityRegistry->getCapabilities($modelId);
+            $result[$caps->provider][] = $modelId;
         }
 
         return $result;
